@@ -12,14 +12,32 @@ bool fDebug = false;
 
 
 // Init openssl library multithreading support
-static HANDLE* lock_cs;
+static std::vector<HANDLE> vLockHandles;
+
+static void FreeLockHandles()
+{
+    for (std::vector<HANDLE>::iterator it = vLockHandles.begin(); it != vLockHandles.end(); ++it)
+    {
+        if (*it != NULL)
+        {
+            CloseHandle(*it);
+            *it = NULL;
+        }
+    }
+    vLockHandles.clear();
+}
 
 void win32_locking_callback(int mode, int type, const char* file, int line)
 {
+    if (type < 0 || type >= (int)vLockHandles.size())
+        return;
+    HANDLE hMutex = vLockHandles[type];
+    if (hMutex == NULL)
+        return;
     if (mode & CRYPTO_LOCK)
-        WaitForSingleObject(lock_cs[type], INFINITE);
+        WaitForSingleObject(hMutex, INFINITE);
     else
-        ReleaseMutex(lock_cs[type]);
+        ReleaseMutex(hMutex);
 }
 
 // Init
@@ -29,9 +47,21 @@ public:
     CInit()
     {
         // Init openssl library multithreading support
-        lock_cs = (HANDLE*)OPENSSL_malloc(CRYPTO_num_locks() * sizeof(HANDLE));
-        for (int i = 0; i < CRYPTO_num_locks(); i++)
-            lock_cs[i] = CreateMutex(NULL,FALSE,NULL);
+        int nLockCount = CRYPTO_num_locks();
+        if (nLockCount <= 0)
+            throw runtime_error("CInit : CRYPTO_num_locks returned invalid count");
+
+        vLockHandles.assign(nLockCount, NULL);
+        for (int i = 0; i < nLockCount; ++i)
+        {
+            vLockHandles[i] = CreateMutex(NULL, FALSE, NULL);
+            if (vLockHandles[i] == NULL)
+            {
+                FreeLockHandles();
+                throw runtime_error("CInit : CreateMutex failed");
+            }
+        }
+
         CRYPTO_set_locking_callback(win32_locking_callback);
 
         // Seed random number generator with screen scrape and other hardware sources
@@ -44,9 +74,7 @@ public:
     {
         // Shutdown openssl library multithreading support
         CRYPTO_set_locking_callback(NULL);
-        for (int i =0 ; i < CRYPTO_num_locks(); i++)
-            CloseHandle(lock_cs[i]);
-        OPENSSL_free(lock_cs);
+        FreeLockHandles();
     }
 }
 instance_of_cinit;
@@ -68,19 +96,36 @@ void RandAddSeed(bool fPerfmon)
         nLastPerfmon = GetTime();
 
         // Seed with the entire set of perfmon data
-        unsigned char pdata[250000];
-        memset(pdata, 0, sizeof(pdata));
-        unsigned long nSize = sizeof(pdata);
-        long ret = RegQueryValueEx(HKEY_PERFORMANCE_DATA, "Global", NULL, NULL, pdata, &nSize);
+        vector<unsigned char> vPerfMon(250000, 0);
+        DWORD nSize = static_cast<DWORD>(vPerfMon.size());
+        unsigned char* pData = vPerfMon.empty() ? NULL : &vPerfMon[0];
+        LONG ret = ERROR_SUCCESS;
+
+        if (pData != NULL)
+        {
+            ret = RegQueryValueEx(HKEY_PERFORMANCE_DATA, "Global", NULL, NULL, pData, &nSize);
+            while (ret == ERROR_MORE_DATA && nSize > 0)
+            {
+                vPerfMon.assign(nSize, 0);
+                pData = &vPerfMon[0];
+                ret = RegQueryValueEx(HKEY_PERFORMANCE_DATA, "Global", NULL, NULL, pData, &nSize);
+            }
+        }
+
         RegCloseKey(HKEY_PERFORMANCE_DATA);
-        if (ret == ERROR_SUCCESS)
+
+        if (ret == ERROR_SUCCESS && pData != NULL && nSize > 0)
         {
             uint256 hash;
-            SHA256(pdata, nSize, (unsigned char*)&hash);
+            SHA256(pData, nSize, (unsigned char*)&hash);
             RAND_add(&hash, sizeof(hash), min(nSize/500.0, (double)sizeof(hash)));
             hash = 0;
-            memset(pdata, 0, nSize);
-            printf("RandAddSeed() got %d bytes of performance data\n", nSize);
+            memset(pData, 0, vPerfMon.size());
+            printf("RandAddSeed() got %lu bytes of performance data\n", nSize);
+        }
+        else if (!vPerfMon.empty())
+        {
+            memset(&vPerfMon[0], 0, vPerfMon.size());
         }
     }
 }

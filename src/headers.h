@@ -33,6 +33,7 @@
 #include <process.h>
 #include <malloc.h>
 #include <memory>
+#include <stdexcept>
 #define BOUNDSCHECK 1
 #include <sstream>
 #include <string>
